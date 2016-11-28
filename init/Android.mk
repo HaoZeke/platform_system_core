@@ -70,12 +70,14 @@ LOCAL_SRC_FILES:= \
     signal_handler.cpp \
     ueventd.cpp \
     ueventd_parser.cpp \
+    vendor_init.cpp \
     watchdogd.cpp \
 
 LOCAL_MODULE:= init
 LOCAL_C_INCLUDES += \
     system/extras/ext4_utils \
-    system/core/mkbootimg
+    system/core/mkbootimg \
+    external/zlib
 
 LOCAL_FORCE_STATIC_EXECUTABLE := true
 LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)
@@ -101,7 +103,10 @@ LOCAL_STATIC_LIBRARIES := \
     libc++_static \
     libdl \
     libsparse_static \
-    libz
+    libz \
+    libext2_blkid \
+    libext2_uuid_static
+
 
 # Create symlinks
 LOCAL_POST_INSTALL_CMD := $(hide) mkdir -p $(TARGET_ROOT_OUT)/sbin; \
@@ -110,6 +115,18 @@ LOCAL_POST_INSTALL_CMD := $(hide) mkdir -p $(TARGET_ROOT_OUT)/sbin; \
 
 LOCAL_SANITIZE := integer
 LOCAL_CLANG := true
+
+ifneq ($(strip $(TARGET_PLATFORM_DEVICE_BASE)),)
+LOCAL_CFLAGS += -D_PLATFORM_BASE="\"$(TARGET_PLATFORM_DEVICE_BASE)\""
+endif
+ifneq ($(strip $(TARGET_INIT_VENDOR_LIB)),)
+LOCAL_WHOLE_STATIC_LIBRARIES += $(TARGET_INIT_VENDOR_LIB)
+endif
+
+ifeq ($(TARGET_INCREASES_COLDBOOT_TIMEOUT),true)
+LOCAL_CFLAGS += -DINCREASE_COLDBOOT_TIMEOUT
+endif
+
 include $(BUILD_EXECUTABLE)
 
 

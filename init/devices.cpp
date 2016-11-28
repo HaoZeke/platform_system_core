@@ -48,6 +48,8 @@
 #include "ueventd_parser.h"
 #include "util.h"
 #include "log.h"
+#include <zlib.h>
+#include "property_service.h"
 
 #define SYSFS_PREFIX    "/sys"
 static const char *firmware_dirs[] = { "/etc/firmware",
@@ -55,6 +57,8 @@ static const char *firmware_dirs[] = { "/etc/firmware",
                                        "/firmware/image" };
 
 extern struct selabel_handle *sehandle;
+
+extern std::string boot_device;
 
 static int device_fd = -1;
 
@@ -167,7 +171,14 @@ void fixup_sys_perms(const char *upath)
     }
     if (access(buf, F_OK) == 0) {
         INFO("restorecon_recursive: %s\n", buf);
+#ifdef _PLATFORM_BASE
+        if(!strcmp(upath, _PLATFORM_BASE))
+            restorecon(buf);
+        else
+            restorecon_recursive(buf);
+#else
         restorecon_recursive(buf);
+#endif
     }
 }
 
@@ -526,6 +537,11 @@ static char **get_block_device_symlinks(struct uevent *uevent)
     else
         links[link_num] = NULL;
 
+    if (pdev && !boot_device.empty() && strstr(device, boot_device.c_str())) {
+        /* Create bootdevice symlink for platform boot stroage device */
+        make_link_init(link_path, "/dev/block/bootdevice");
+    }
+
     return links;
 }
 
@@ -756,23 +772,20 @@ static void handle_device_event(struct uevent *uevent)
     }
 }
 
-static int load_firmware(int fw_fd, int loading_fd, int data_fd)
+static int load_firmware(int fw_fd, gzFile gz_fd, int loading_fd, int data_fd)
 {
-    struct stat st;
-    long len_to_copy;
     int ret = 0;
-
-    if(fstat(fw_fd, &st) < 0)
-        return -1;
-    len_to_copy = st.st_size;
 
     write(loading_fd, "1", 1);  /* start transfer */
 
-    while (len_to_copy > 0) {
+    while (1) {
         char buf[PAGE_SIZE];
         ssize_t nr;
 
-        nr = read(fw_fd, buf, sizeof(buf));
+        if (gz_fd)
+            nr = gzread(gz_fd, buf, sizeof(buf));
+        else
+            nr = read(fw_fd, buf, sizeof(buf));
         if(!nr)
             break;
         if(nr < 0) {
@@ -783,13 +796,14 @@ static int load_firmware(int fw_fd, int loading_fd, int data_fd)
             ret = -1;
             break;
         }
-        len_to_copy -= nr;
     }
 
     if(!ret)
         write(loading_fd, "0", 1);  /* successful end of transfer */
-    else
+    else {
+        ERROR("%s: aborted transfer\n", __func__);
         write(loading_fd, "-1", 2); /* abort transfer */
+    }
 
     return ret;
 }
@@ -799,12 +813,29 @@ static int is_booting(void)
     return access("/dev/.booting", F_OK) == 0;
 }
 
+gzFile fw_gzopen(const char *fname, const char *mode)
+{
+    char *gzfile = NULL;
+    int l;
+    gzFile gz_fd = Z_NULL;
+
+    l = asprintf(&gzfile, "%s.gz", fname);
+    if (l == -1)
+        goto out;
+
+    gz_fd = gzopen(gzfile, mode);
+    free(gzfile);
+out:
+    return gz_fd;
+}
+
 static void process_firmware_event(struct uevent *uevent)
 {
     char *root, *loading, *data;
     int l, loading_fd, data_fd, fw_fd;
     size_t i;
     int booting = is_booting();
+    gzFile gz_fd = NULL;
 
     INFO("firmware: loading '%s' for '%s'\n",
          uevent->firmware, uevent->path);
@@ -837,15 +868,18 @@ try_loading_again:
             goto data_free_out;
         fw_fd = open(file, O_RDONLY|O_CLOEXEC);
         free(file);
-        if (fw_fd >= 0) {
-            if(!load_firmware(fw_fd, loading_fd, data_fd))
+        if (fw_fd < 0){
+            gz_fd = fw_gzopen(file, "rb");
+        }
+        if (fw_fd >= 0 || gz_fd) {
+            if(!load_firmware(fw_fd, gz_fd, loading_fd, data_fd))
                 INFO("firmware: copy success { '%s', '%s' }\n", root, uevent->firmware);
             else
                 INFO("firmware: copy failure { '%s', '%s' }\n", root, uevent->firmware);
             break;
         }
     }
-    if (fw_fd < 0) {
+    if ((fw_fd < 0) && !gz_fd) {
         if (booting) {
             /* If we're not fully booted, we may be missing
              * filesystems needed for firmware, wait and retry.
@@ -859,7 +893,10 @@ try_loading_again:
         goto data_close_out;
     }
 
-    close(fw_fd);
+    if (gz_fd)
+        gzclose(gz_fd);
+    else
+        close(fw_fd);
 data_close_out:
     close(data_fd);
 loading_close_out:
